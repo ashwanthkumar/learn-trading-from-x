@@ -1,11 +1,12 @@
 """
 Debit Spread Strategy — high-IV variant (bull call spread + bear put spread).
 
-Used when straddle premium > high_iv_threshold% of spot.
+Used when straddle premium > high_iv_threshold of spot.
 Structure:
   - Bull call spread: buy ATM CE, sell OTM CE (+1 interval)
   - Bear put spread:  buy ATM PE, sell OTM PE (+1 interval)
 
+Delta hedge: sell/buy 1 lot Nifty futures per 50-pt spot move.
 Same exit rules as long straddle.
 """
 
@@ -22,10 +23,6 @@ STRIKE_INTERVAL = 50
 
 
 class DebitSpreadStrategy(Strategy):
-    """
-    High-IV positional: buy ATM straddle + sell OTM wings to reduce premium outflow.
-    Entry on Monday open when straddle > high_iv_threshold of spot.
-    """
 
     def on_bar(
         self,
@@ -37,31 +34,35 @@ class DebitSpreadStrategy(Strategy):
         portfolio,
     ) -> list[Order]:
         orders: list[Order] = []
-        weekday = trade_date.weekday()  # 0=Mon, 3=Thu
-
-        # ── Check exits when position is open ──
-        if state.active_legs:
-            orders += self._check_exits(chain, trade_date, bar_time, expiry_key, state)
-            return orders
-
-        # ── Entry: Monday open only ──
-        if weekday != 0:
-            return orders
+        weekday = trade_date.weekday()
 
         atm_strike, spot = find_atm(chain)
-        if atm_strike is None or spot is None:
+
+        # ── Manage open position ──
+        if state.active_legs:
+            if spot is None:
+                return orders
+
+            exit_orders = self._check_exits(chain, trade_date, bar_time, state, spot)
+            if exit_orders:
+                return exit_orders
+
+            # Delta hedge every 50-pt move
+            orders += self.delta_hedge_orders(chain, trade_date, bar_time, state, spot)
+            return orders
+
+        # ── Entry: Monday open, high-IV only ──
+        if weekday != 0 or atm_strike is None or spot is None:
             return orders
 
         straddle = get_straddle_premium(chain, atm_strike)
         if straddle is None:
             return orders
 
-        # Only enter when IV is elevated
         if straddle_as_pct_of_spot(straddle, spot) <= self.high_iv_threshold:
-            return orders
+            return orders  # normal IV, let long straddle handle
 
         otm_strike = atm_strike + STRIKE_INTERVAL
-
         legs = [
             (atm_strike, "CE", "BUY"),
             (otm_strike,  "CE", "SELL"),
@@ -75,11 +76,10 @@ class DebitSpreadStrategy(Strategy):
         for strike, opt_type, action in legs:
             bar = chain.get(strike, {}).get(opt_type)
             if bar is None:
-                return []  # Abort if any leg is missing
+                return []
             price = bar.get("close", 0)
             sign = 1 if action == "BUY" else -1
             net_premium += sign * price
-
             orders.append(Order(
                 symbol=f"NIFTY{strike}{opt_type}",
                 expiry_key=expiry_key,
@@ -100,13 +100,13 @@ class DebitSpreadStrategy(Strategy):
         state.entry_strike = atm_strike
         state.expiry_key = expiry_key
         state.lots = self.lots
+        state.last_hedge_spot = spot
 
         return orders
 
     def _current_pnl_pct(self, chain: dict, state: StrategyState) -> float | None:
         if state.entry_premium <= 0:
             return None
-
         total_pnl = 0.0
         for leg in state.active_legs:
             bar = chain.get(leg["strike"], {}).get(leg["opt_type"])
@@ -118,7 +118,6 @@ class DebitSpreadStrategy(Strategy):
             entry_price = leg.get("entry_price", 0)
             sign = 1 if leg["action"] == "BUY" else -1
             total_pnl += sign * (price - entry_price)
-
         return total_pnl / state.entry_premium
 
     def _check_exits(
@@ -126,12 +125,11 @@ class DebitSpreadStrategy(Strategy):
         chain: dict,
         trade_date: date,
         bar_time: time,
-        expiry_key: str,
         state: StrategyState,
+        spot: float,
     ) -> list[Order]:
-        orders = []
         weekday = trade_date.weekday()
-        expiry_date = date.fromisoformat(state.expiry_key or expiry_key)
+        expiry_date = date.fromisoformat(state.expiry_key)
         reason = None
 
         if weekday >= 3 or trade_date >= expiry_date:
@@ -148,10 +146,10 @@ class DebitSpreadStrategy(Strategy):
         if reason is None:
             return []
 
+        orders = []
         for leg in state.active_legs:
             bar = chain.get(leg["strike"], {}).get(leg["opt_type"])
             price = bar.get("close", 0) if bar else 0
-            # Reverse the original action to close
             close_action = "SELL" if leg["action"] == "BUY" else "BUY"
             orders.append(Order(
                 symbol=f"NIFTY{leg['strike']}{leg['opt_type']}",
@@ -166,9 +164,6 @@ class DebitSpreadStrategy(Strategy):
                 tag=reason,
             ))
 
-        state.active_legs = []
-        state.entry_premium = 0.0
-        state.entry_strike = 0
-        state.expiry_key = ""
-
+        orders += self.close_all_hedges(trade_date, bar_time, state, spot)
+        state.reset()
         return orders

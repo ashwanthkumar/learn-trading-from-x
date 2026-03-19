@@ -1,29 +1,30 @@
 """
-Backtest engine: iterates over trading days and bars, calls strategy on each bar.
+Backtest engine: iterates over every 1-minute bar of every trading day,
+calling the strategy on each bar.
 
 Design:
 - For each month in the date range, extract & index the RAR.
-- For each trading day, build the EOD chain (last bar of day per strike).
-- Call strategy.on_bar() → collect orders → execute at market (same bar price).
-- Record EOD equity.
+- For each trading day, enumerate all 1-minute timestamps that appear in the data.
+- For each bar, build the option chain snapshot and call strategy.on_bar().
+- Orders execute at the bar 2 bars later (t+2 slippage to simulate live latency).
+- Record EOD equity after the last bar of each day.
 """
 
 from __future__ import annotations
 
+import calendar
 import sys
 from datetime import date, time
 
-from src.data.chain import build_chain, clear_cache
+import pandas as pd
+
+from src.data.chain import build_chain, clear_cache, _load_csv
 from src.data.loader import extract_month, index_nifty_files
-from src.data.synthetic import find_atm
 from src.strategies.base import Strategy, StrategyState
 from src.backtest.portfolio import Portfolio
 
-# Indian market session
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
-# Bar we use for strategy decisions (end of day signal)
-EOD_BAR = time(15, 25)
 
 
 class BacktestEngine:
@@ -41,16 +42,14 @@ class BacktestEngine:
         self.portfolio = Portfolio(initial_cash)
         self.verbose = verbose
         self._state = StrategyState()
+        # t+2 fill queue: list of (bars_remaining, [orders])
+        self._order_queue: list[tuple[int, list]] = []
 
     def run(self) -> Portfolio:
-        """Run the backtest; return portfolio with full trade log and equity curve."""
-        # Generate (year, month) pairs to process
         months = self._months_in_range()
-
         for year, month in months:
             self._process_month(year, month)
-            clear_cache()  # Free RAM between months
-
+            clear_cache()
         return self.portfolio
 
     def _months_in_range(self) -> list[tuple[int, int]]:
@@ -82,60 +81,112 @@ class BacktestEngine:
             print(f"  No NIFTY files found for {year}-{month:02d}")
             return
 
-        # Get all trading days for this month that fall in [start_date, end_date]
-        trading_days = self._get_trading_days(index, year, month)
-
+        trading_days = self._get_trading_days(year, month)
         for trade_date in trading_days:
             self._process_day(index, trade_date)
 
-    def _get_trading_days(self, index: dict, year: int, month: int) -> list[date]:
-        """
-        Return all weekdays in (year, month) that fall within the backtest range.
-        The engine will naturally skip days with no chain data.
-        """
-        import calendar
+    def _get_trading_days(self, year: int, month: int) -> list[date]:
         _, last_day = calendar.monthrange(year, month)
-        days = []
-        for day in range(1, last_day + 1):
-            d = date(year, month, day)
-            if d.weekday() < 5 and self.start_date <= d <= self.end_date:
-                days.append(d)
-        return days
+        return [
+            date(year, month, day)
+            for day in range(1, last_day + 1)
+            if date(year, month, day).weekday() < 5
+            and self.start_date <= date(year, month, day) <= self.end_date
+        ]
+
+    def _get_bar_timestamps(self, index: dict, trade_date: date, expiry_key: str) -> list[pd.Timestamp]:
+        """
+        Enumerate all 1-minute timestamps for this date by reading a handful
+        of liquid strike CSVs and taking the union of their timestamps.
+        """
+        strikes_data = index.get(expiry_key, {})
+        timestamps: set[pd.Timestamp] = set()
+        files_checked = 0
+
+        for strike_data in strikes_data.values():
+            path = strike_data.get("PE") or strike_data.get("CE")
+            if path is None or not path.exists():
+                continue
+            try:
+                df = _load_csv(path)
+                day_mask = df.index.date == trade_date
+                timestamps.update(df.index[day_mask])
+                files_checked += 1
+            except Exception:
+                continue
+            if files_checked >= 5:  # 5 files gives good timestamp coverage
+                break
+
+        return sorted(timestamps)
 
     def _process_day(self, index: dict, trade_date: date) -> None:
-        """Process all bars for a single trading day."""
-        # Select nearest expiry on or after trade_date
         expiry_key = self.strategy.select_nearest_expiry(index, trade_date)
         if expiry_key is None:
             return
 
-        # Build EOD chain
-        chain = build_chain(index, trade_date, expiry_key, bar_time=EOD_BAR)
-        if not chain:
+        bar_timestamps = self._get_bar_timestamps(index, trade_date, expiry_key)
+        if not bar_timestamps:
             return
 
-        # Call strategy
-        orders = self.strategy.on_bar(
-            chain=chain,
-            trade_date=trade_date,
-            bar_time=EOD_BAR,
-            expiry_key=expiry_key,
-            state=self._state,
-            portfolio=self.portfolio,
-        )
+        last_chain = None
 
-        # Execute orders
-        for order in orders:
-            # Use the provided price (same-bar execution; no next-bar slippage in EOD mode)
-            self.portfolio.execute(order)
+        for ts in bar_timestamps:
+            bar_time = ts.time()
 
-        # Record EOD equity
-        self.portfolio.record_eod(trade_date, chain)
+            # Build chain for this bar
+            chain = build_chain(index, trade_date, expiry_key, bar_time=bar_time)
+            if not chain:
+                continue
 
-        if self.verbose:
+            # Tick down the t+2 queue and fill orders whose countdown reached 0
+            still_pending = []
+            for bars_left, orders in self._order_queue:
+                bars_left -= 1
+                if bars_left <= 0:
+                    for order in orders:
+                        # Fill at this bar's open price
+                        if order.opt_type != "FUT":
+                            bar = chain.get(order.strike, {}).get(order.opt_type)
+                            if bar is not None:
+                                order.price = bar.get("open", order.price)
+                        self.portfolio.execute(order)
+                else:
+                    still_pending.append((bars_left, orders))
+            self._order_queue = still_pending
+
+            # Call strategy — returns orders to enqueue with t+2 countdown
+            new_orders = self.strategy.on_bar(
+                chain=chain,
+                trade_date=trade_date,
+                bar_time=bar_time,
+                expiry_key=expiry_key,
+                state=self._state,
+                portfolio=self.portfolio,
+            )
+            if new_orders:
+                self._order_queue.append((2, new_orders))
+
+            last_chain = chain
+
+        # Flush any unfilled orders at EOD close (can't carry across days for options)
+        if self._order_queue and last_chain:
+            for _, orders in self._order_queue:
+                for order in orders:
+                    if order.opt_type != "FUT":
+                        bar = last_chain.get(order.strike, {}).get(order.opt_type)
+                        if bar is not None:
+                            order.price = bar.get("close", order.price)
+                    self.portfolio.execute(order)
+            self._order_queue = []
+
+        # Record EOD equity using the last available chain
+        if last_chain:
+            self.portfolio.record_eod(trade_date, last_chain)
+
+        if self.verbose and last_chain:
             eq = self.portfolio.equity_curve[-1]["equity"]
+            n_bars = len(bar_timestamps)
             print(
-                f"  {trade_date} | expiry={expiry_key} | "
-                f"orders={len(orders)} | equity={eq:,.0f}",
+                f"  {trade_date} | expiry={expiry_key} | bars={n_bars} | equity={eq:,.0f}",
                 flush=True,
             )
