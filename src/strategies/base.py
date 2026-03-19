@@ -14,7 +14,8 @@ DELTA_HEDGE_LOTS = 1        # lots of ITM options per hedge leg
 STRIKE_INTERVAL = 50        # Nifty strike grid
 
 # Intraday mode timing
-INTRADAY_ENTRY_CUTOFF = time(9, 30)   # only enter before this time
+INTRADAY_ENTRY_FROM = time(9, 16)     # earliest bar allowed for entry (skip 09:15 open)
+INTRADAY_ENTRY_CUTOFF = time(14, 0)   # latest bar allowed for entry
 INTRADAY_EXIT_TIME = time(15, 15)     # force-exit at or after this time
 
 
@@ -115,7 +116,7 @@ class Strategy(ABC):
         if state.active_legs:
             return False
         if self.intraday:
-            return bar_time <= INTRADAY_ENTRY_CUTOFF
+            return INTRADAY_ENTRY_FROM <= bar_time <= INTRADAY_ENTRY_CUTOFF
         else:
             return trade_date.weekday() == 0  # Monday only
 
