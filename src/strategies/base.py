@@ -53,22 +53,27 @@ class StrategyState:
         self.hedge_legs = []
 
 
+HEDGE_STRIKE_GRID = 100  # ITM hedge options snap to 100pt strike intervals
+
+
 def _itm_pe_strike(spot: float) -> int:
     """
     PE is ITM when strike > spot.
-    Buy PE 50pts ITM: strike = round_50(spot + 50).
-    e.g. spot=21825 → 21875 → rounded to 21900.
+    Target ~100-150pts ITM, snapped to the next 100pt strike above (spot + 100).
+    e.g. spot=21825 → spot+100=21925 → ceil to 100pt grid → 22000 (175pts ITM)
+         spot=21900 → spot+100=22000 → 22000 (100pts ITM)
     """
-    return int(round((spot + STRIKE_INTERVAL) / STRIKE_INTERVAL) * STRIKE_INTERVAL)
+    return int(math.ceil((spot + HEDGE_STRIKE_GRID) / HEDGE_STRIKE_GRID) * HEDGE_STRIKE_GRID)
 
 
 def _itm_ce_strike(spot: float) -> int:
     """
     CE is ITM when strike < spot.
-    Buy CE 50pts ITM: strike = round_50(spot - 50).
-    e.g. spot=21825 → 21775 → rounded to 21800.
+    Target ~100-150pts ITM, snapped to the next 100pt strike below (spot - 100).
+    e.g. spot=21825 → spot-100=21725 → floor to 100pt grid → 21700 (125pts ITM)
+         spot=21900 → spot-100=21800 → 21800 (100pts ITM)
     """
-    return int(round((spot - STRIKE_INTERVAL) / STRIKE_INTERVAL) * STRIKE_INTERVAL)
+    return int(math.floor((spot - HEDGE_STRIKE_GRID) / HEDGE_STRIKE_GRID) * HEDGE_STRIKE_GRID)
 
 
 class Strategy(ABC):
