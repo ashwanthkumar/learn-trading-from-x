@@ -58,6 +58,10 @@ def main() -> None:
         help="Straddle-as-pct-of-spot threshold for high-IV regime (default: 0.025 = 2.5%%)"
     )
     parser.add_argument(
+        "--intraday", action="store_true",
+        help="Intraday mode: enter any day ≤09:30, exit at 15:15 (default: positional Mon–Thu)"
+    )
+    parser.add_argument(
         "--quiet", action="store_true",
         help="Suppress per-bar verbose output"
     )
@@ -70,8 +74,9 @@ def main() -> None:
         print("Error: --from must be before --to", file=sys.stderr)
         sys.exit(1)
 
+    mode = "intraday" if args.intraday else "positional"
     print(f"Backtest: {start_date} → {end_date}")
-    print(f"Strategy: {args.strategy} | Lots: {args.lots} | Capital: ₹{args.capital:,.0f}")
+    print(f"Strategy: {args.strategy} | Mode: {mode} | Lots: {args.lots} | Capital: ₹{args.capital:,.0f}")
     print(f"IV threshold: {args.iv_threshold*100:.1f}%")
     print()
 
@@ -93,12 +98,14 @@ def main() -> None:
             strategy = LongStraddleStrategy(
                 lots=args.lots,
                 high_iv_threshold=args.iv_threshold,
+                intraday=args.intraday,
             )
         else:
             from src.strategies.debit_spread import DebitSpreadStrategy
             strategy = DebitSpreadStrategy(
                 lots=args.lots,
                 high_iv_threshold=args.iv_threshold,
+                intraday=args.intraday,
             )
 
         engine = BacktestEngine(
@@ -110,7 +117,7 @@ def main() -> None:
         )
 
         portfolio = engine.run()
-        generate_report(portfolio, strat_name, start_date, end_date)
+        generate_report(portfolio, strat_name, start_date, end_date, intraday=args.intraday)
 
 
 if __name__ == "__main__":

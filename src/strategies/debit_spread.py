@@ -6,10 +6,12 @@ Structure:
   - Bull call spread: buy ATM CE, sell OTM CE (+1 interval)
   - Bear put spread:  buy ATM PE, sell OTM PE (+1 interval)
 
+Positional mode (default): Monday entry, Thursday exit.
+Intraday mode (--intraday): enter any day ≤ 09:30, exit at 15:15.
+
 Adjustments when in position:
-  - Delta hedge: buy ITM options (50pts ITM) every 75-pt spot move.
-  - Sold-leg roll: when spot moves 75pts from entry strike, roll the short legs
-    to new OTM strikes (+1 interval from new ATM) to avoid the sold leg going ATM/ITM.
+  - Sold-leg roll: when spot moves 75pts from entry strike.
+  - Delta hedge: buy ITM options (100-150pts ITM) every 75-pt spot move.
 """
 
 from __future__ import annotations
@@ -42,29 +44,23 @@ class DebitSpreadStrategy(Strategy):
         portfolio,
     ) -> list[Order]:
         orders: list[Order] = []
-        weekday = trade_date.weekday()
         atm_strike, spot = find_atm(chain)
 
         # ── Manage open position ──
         if state.active_legs:
             if spot is None:
                 return orders
-
-            # 1. Check exits first
             exit_orders = self._check_exits(chain, trade_date, bar_time, state, spot)
             if exit_orders:
                 return exit_orders
-
-            # 2. Roll sold legs if spot moved 75pts from entry strike
             orders += self._check_sold_leg_roll(chain, trade_date, bar_time, state, spot)
-
-            # 3. Delta hedge via ITM options every 75pts
             orders += self.delta_hedge_orders(chain, trade_date, bar_time, state, spot)
-
             return orders
 
-        # ── Entry: Monday open, high-IV only ──
-        if weekday != 0 or atm_strike is None or spot is None:
+        # ── Entry: high-IV only ──
+        if not self.can_enter(trade_date, bar_time, state):
+            return orders
+        if atm_strike is None or spot is None:
             return orders
 
         straddle = get_straddle_premium(chain, atm_strike)
@@ -216,11 +212,9 @@ class DebitSpreadStrategy(Strategy):
         state: StrategyState,
         spot: float,
     ) -> list[Order]:
-        weekday = trade_date.weekday()
-        expiry_date = date.fromisoformat(state.expiry_key)
         reason = None
 
-        if weekday >= 3 or trade_date >= expiry_date:
+        if self.is_time_exit(trade_date, bar_time, state.expiry_key):
             reason = "time_exit"
 
         if reason is None:

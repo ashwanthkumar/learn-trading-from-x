@@ -13,6 +13,10 @@ DELTA_HEDGE_INTERVAL = 75   # trigger a hedge every 75-pt spot move
 DELTA_HEDGE_LOTS = 1        # lots of ITM options per hedge leg
 STRIKE_INTERVAL = 50        # Nifty strike grid
 
+# Intraday mode timing
+INTRADAY_ENTRY_CUTOFF = time(9, 30)   # only enter before this time
+INTRADAY_EXIT_TIME = time(15, 15)     # force-exit at or after this time
+
 
 @dataclass
 class Order:
@@ -79,9 +83,15 @@ def _itm_ce_strike(spot: float) -> int:
 class Strategy(ABC):
     """Base class for all strategies. Includes shared delta-hedge logic."""
 
-    def __init__(self, lots: int = 1, high_iv_threshold: float = 0.025):
+    def __init__(
+        self,
+        lots: int = 1,
+        high_iv_threshold: float = 0.025,
+        intraday: bool = False,
+    ):
         self.lots = lots
         self.high_iv_threshold = high_iv_threshold
+        self.intraday = intraday  # True → enter/exit same day; False → positional
 
     @abstractmethod
     def on_bar(
@@ -99,6 +109,23 @@ class Strategy(ABC):
     def select_nearest_expiry(self, index: dict, trade_date: date) -> str | None:
         future_expiries = [k for k in index if k >= trade_date.strftime("%Y-%m-%d")]
         return min(future_expiries) if future_expiries else None
+
+    def can_enter(self, trade_date: date, bar_time: time, state: StrategyState) -> bool:
+        """Return True if this bar is a valid entry point."""
+        if state.active_legs:
+            return False
+        if self.intraday:
+            return bar_time <= INTRADAY_ENTRY_CUTOFF
+        else:
+            return trade_date.weekday() == 0  # Monday only
+
+    def is_time_exit(self, trade_date: date, bar_time: time, expiry_key: str) -> bool:
+        """Return True if the time-based exit condition is met."""
+        if self.intraday:
+            return bar_time >= INTRADAY_EXIT_TIME
+        else:
+            expiry_date = date.fromisoformat(expiry_key)
+            return trade_date.weekday() >= 3 or trade_date >= expiry_date
 
     def delta_hedge_orders(
         self,

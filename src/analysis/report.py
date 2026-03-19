@@ -21,6 +21,7 @@ def generate_report(
     strategy_name: str,
     start_date: date,
     end_date: date,
+    intraday: bool = False,
 ) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -31,8 +32,8 @@ def generate_report(
     metrics = compute_metrics(equity_df, trade_df)
     print_metrics(metrics)
 
-    # Save trade log CSV
-    tag = f"{strategy_name}_{start_date}_{end_date}"
+    mode = "intraday" if intraday else "positional"
+    tag = f"{strategy_name}_{mode}_{start_date}_{end_date}"
     if not trade_df.empty:
         trade_path = OUTPUT_DIR / f"trade_log_{tag}.csv"
         trade_df.to_csv(trade_path, index=False)
