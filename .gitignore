@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.python-version
+
+# Extracted data cache (large, regenerated on demand)
+.cache/
+
+# Backtest output (generated artifacts)
+output/
+
+# uv
+.uv/

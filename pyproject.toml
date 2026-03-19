@@ -1,0 +1,10 @@
+[project]
+name = "learn-trading-from-x"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "pandas>=3.0.1",
+    "rarfile>=4.2",
+]
