@@ -159,7 +159,7 @@ class LongStraddleStrategy(Strategy):
             ))
 
         # Flatten all delta hedges at exit
-        orders += self.close_all_hedges(trade_date, bar_time, state, spot)
+        orders += self.close_all_hedges(chain, trade_date, bar_time, state)
         state.reset()
         return orders
 

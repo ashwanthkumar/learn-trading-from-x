@@ -1,5 +1,5 @@
 """
-Portfolio: tracks positions (options + futures), cash, and MTM P&L.
+Portfolio: tracks option positions, cash, and MTM P&L.
 
 Lot sizes:
   - Pre-Oct 2024: 50 units per lot
@@ -18,7 +18,6 @@ from src.strategies.base import Order
 
 
 def lot_size(trade_date: date) -> int:
-    """Return Nifty lot size for the given trade date."""
     cutoff = date(2024, 10, 1)
     return 75 if trade_date >= cutoff else 50
 
@@ -28,12 +27,12 @@ class Position:
     symbol: str
     expiry_key: str
     strike: int
-    opt_type: str           # CE, PE, or FUT
+    opt_type: str               # CE or PE
     action: Literal["BUY", "SELL"]
     qty_lots: int
     entry_price: float
     entry_date: date
-    units: int              # qty_lots * lot_size
+    units: int                  # qty_lots * lot_size
 
 
 class Portfolio:
@@ -45,25 +44,27 @@ class Portfolio:
         self.equity_curve: list[dict] = []
 
     def execute(self, order: Order) -> None:
-        """Execute an order: update cash and position book."""
         units = order.qty * lot_size(order.trade_date)
         price = order.price
 
-        if order.opt_type == "FUT":
-            self._execute_futures(order, units, price)
-        elif order.action == "BUY":
-            self._open_long(order, units, price)
+        if order.action == "BUY":
+            # Try to close an existing short position first (buy-to-close)
+            matched_short = self._find_position(order.symbol, order.strike, order.opt_type, "SELL")
+            if matched_short:
+                self._close_short(order, matched_short, units, price)
+            else:
+                self._open_long(order, units, price)
+
         elif order.action == "SELL":
-            # Try to close an existing long first; otherwise open a short
-            matched = self._find_position(order.symbol, order.strike, order.opt_type, "BUY")
-            if matched:
-                self._close_long(order, matched, units, price)
+            # Try to close an existing long position first (sell-to-close)
+            matched_long = self._find_position(order.symbol, order.strike, order.opt_type, "BUY")
+            if matched_long:
+                self._close_long(order, matched_long, units, price)
             else:
                 self._open_short(order, units, price)
 
     def _open_long(self, order: Order, units: int, price: float) -> None:
-        cost = price * units
-        self.cash -= cost
+        self.cash -= price * units
         self.positions.append(Position(
             symbol=order.symbol, expiry_key=order.expiry_key,
             strike=order.strike, opt_type=order.opt_type,
@@ -73,13 +74,14 @@ class Portfolio:
         self.trade_log.append({
             "date": order.trade_date, "time": order.trade_time,
             "symbol": order.symbol, "action": "BUY",
-            "price": price, "units": units, "cash_flow": -cost, "tag": order.tag,
+            "price": price, "units": units,
+            "cash_flow": -(price * units), "tag": order.tag,
         })
 
     def _close_long(self, order: Order, matched: Position, units: int, price: float) -> None:
         proceeds = price * units
-        self.cash += proceeds
         pnl = (price - matched.entry_price) * units
+        self.cash += proceeds
         self.positions.remove(matched)
         self.trade_log.append({
             "date": order.trade_date, "time": order.trade_time,
@@ -92,7 +94,6 @@ class Portfolio:
         })
 
     def _open_short(self, order: Order, units: int, price: float) -> None:
-        """Open a short option position (for debit spread sold legs)."""
         self.cash += price * units  # receive premium
         self.positions.append(Position(
             symbol=order.symbol, expiry_key=order.expiry_key,
@@ -106,89 +107,48 @@ class Portfolio:
             "price": price, "units": units, "cash_flow": price * units, "tag": order.tag,
         })
 
-    def _execute_futures(self, order: Order, units: int, price: float) -> None:
-        """
-        Execute a delta-hedge futures trade.
-        BUY futures: net long delta offset (spot fell, we're net short delta).
-        SELL futures: net short delta offset (spot rose, we're net long delta).
-        Futures require no cash outlay (margin not modelled); P&L is mark-to-market.
-        We store futures positions and mark them vs current synthetic spot.
-        """
-        # Look for an offsetting futures position to close (netting)
-        reverse_action = "SELL" if order.action == "BUY" else "BUY"
-        matched = self._find_position(order.symbol, order.strike, order.opt_type, reverse_action)
-
-        if matched:
-            # Close (fully or partially) an existing futures leg
-            pnl = ((price - matched.entry_price) * units
-                   if reverse_action == "BUY"   # we were long, now selling
-                   else (matched.entry_price - price) * units)  # we were short, now buying
-            self.cash += pnl  # futures P&L settles to cash
-            self.positions.remove(matched)
-            self.trade_log.append({
-                "date": order.trade_date, "time": order.trade_time,
-                "symbol": order.symbol, "action": f"FUT_{order.action}_CLOSE",
-                "price": price, "units": units, "cash_flow": pnl,
-                "pnl": pnl, "entry_price": matched.entry_price,
-                "entry_date": matched.entry_date,
-                "hold_days": (order.trade_date - matched.entry_date).days,
-                "tag": order.tag,
-            })
-        else:
-            # Open a new futures leg (no cash outlay, margin ignored)
-            self.positions.append(Position(
-                symbol=order.symbol, expiry_key=order.expiry_key,
-                strike=0, opt_type="FUT",
-                action=order.action, qty_lots=order.qty,
-                entry_price=price, entry_date=order.trade_date, units=units,
-            ))
-            self.trade_log.append({
-                "date": order.trade_date, "time": order.trade_time,
-                "symbol": order.symbol, "action": f"FUT_{order.action}_OPEN",
-                "price": price, "units": units, "cash_flow": 0.0, "tag": order.tag,
-            })
+    def _close_short(self, order: Order, matched: Position, units: int, price: float) -> None:
+        cost = price * units
+        pnl = (matched.entry_price - price) * units  # profit when buying back cheaper
+        self.cash -= cost
+        self.positions.remove(matched)
+        self.trade_log.append({
+            "date": order.trade_date, "time": order.trade_time,
+            "symbol": order.symbol, "action": "BUY_CLOSE",
+            "price": price, "units": units, "cash_flow": -cost,
+            "pnl": pnl, "entry_price": matched.entry_price,
+            "entry_date": matched.entry_date,
+            "hold_days": (order.trade_date - matched.entry_date).days,
+            "tag": order.tag,
+        })
 
     def _find_position(
         self, symbol: str, strike: int, opt_type: str, action: str
     ) -> Position | None:
         for p in self.positions:
-            if p.symbol == symbol and p.strike == strike and p.opt_type == opt_type and p.action == action:
+            if (p.symbol == symbol and p.strike == strike
+                    and p.opt_type == opt_type and p.action == action):
                 return p
         return None
 
-    def mtm_value(self, chain: dict, synthetic_spot: float | None = None) -> float:
-        """Mark all open positions to market."""
-        from src.data.synthetic import find_atm
-        if synthetic_spot is None:
-            _, synthetic_spot = find_atm(chain)
-
+    def mtm_value(self, chain: dict) -> float:
         mtm = 0.0
         for pos in self.positions:
-            if pos.opt_type == "FUT":
-                # Mark futures vs current synthetic spot
-                if synthetic_spot is not None:
-                    current_price = synthetic_spot
-                    if pos.action == "BUY":
-                        mtm += (current_price - pos.entry_price) * pos.units
-                    else:
-                        mtm += (pos.entry_price - current_price) * pos.units
+            bar = chain.get(pos.strike, {}).get(pos.opt_type)
+            current_price = bar.get("close", pos.entry_price) if bar else pos.entry_price
+            if pos.action == "BUY":
+                mtm += (current_price - pos.entry_price) * pos.units
             else:
-                bar = chain.get(pos.strike, {}).get(pos.opt_type)
-                current_price = bar.get("close", pos.entry_price) if bar else pos.entry_price
-                if pos.action == "BUY":
-                    mtm += (current_price - pos.entry_price) * pos.units
-                else:
-                    mtm += (pos.entry_price - current_price) * pos.units
+                mtm += (pos.entry_price - current_price) * pos.units
         return mtm
 
     def record_eod(self, trade_date: date, chain: dict) -> None:
         mtm = self.mtm_value(chain)
-        equity = self.cash + mtm
         self.equity_curve.append({
             "date": trade_date,
             "cash": self.cash,
             "mtm": mtm,
-            "equity": equity,
+            "equity": self.cash + mtm,
             "open_positions": len(self.positions),
         })
 

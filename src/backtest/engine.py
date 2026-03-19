@@ -145,10 +145,9 @@ class BacktestEngine:
                 if bars_left <= 0:
                     for order in orders:
                         # Fill at this bar's open price
-                        if order.opt_type != "FUT":
-                            bar = chain.get(order.strike, {}).get(order.opt_type)
-                            if bar is not None:
-                                order.price = bar.get("open", order.price)
+                        bar = chain.get(order.strike, {}).get(order.opt_type)
+                        if bar is not None:
+                            order.price = bar.get("open", order.price)
                         self.portfolio.execute(order)
                 else:
                     still_pending.append((bars_left, orders))
@@ -168,14 +167,13 @@ class BacktestEngine:
 
             last_chain = chain
 
-        # Flush any unfilled orders at EOD close (can't carry across days for options)
+        # Flush any unfilled orders at EOD close (can't carry orders across days)
         if self._order_queue and last_chain:
             for _, orders in self._order_queue:
                 for order in orders:
-                    if order.opt_type != "FUT":
-                        bar = last_chain.get(order.strike, {}).get(order.opt_type)
-                        if bar is not None:
-                            order.price = bar.get("close", order.price)
+                    bar = last_chain.get(order.strike, {}).get(order.opt_type)
+                    if bar is not None:
+                        order.price = bar.get("close", order.price)
                     self.portfolio.execute(order)
             self._order_queue = []
 
